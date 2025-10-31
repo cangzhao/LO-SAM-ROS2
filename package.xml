@@ -29,8 +29,6 @@
   <build_depend>pcl_conversions</build_depend>
   <build_depend>tf2_geometry_msgs</build_depend>
   <build_depend>visualization_msgs</build_depend>
-  <build_depend>opencv4</build_depend>
-  <build_depend>gtsam</build_depend>
   <!-- 执行依赖 -->
   <exec_depend>geometry_msgs</exec_depend>
   <exec_depend>nav_msgs</exec_depend>
@@ -43,8 +41,6 @@
   <exec_depend>pcl_conversions</exec_depend>
   <exec_depend>tf2_geometry_msgs</exec_depend>
   <exec_depend>visualization_msgs</exec_depend>
-  <exec_depend>opencv4</exec_depend>
-  <exec_depend>gtsam</exec_depend>
   <!-- 根据实际代码使用情况添加 rclcpp/rclpy 等依赖 -->
   <build_depend>rclcpp</build_depend>
   <exec_depend>rclcpp</exec_depend>
