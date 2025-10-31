@@ -1,46 +1,62 @@
 <?xml version="1.0"?>
-<package>
+<package format="3">
   <name>lo_sam</name>
   <version>0.0.0</version>
-
   <description>
-    This is an advanced implentation of LOAM.
+    This is an advanced implementation of LOAM.
     LOAM is described in the following paper:
     J. Zhang and S. Singh. LOAM: Lidar Odometry and Mapping in Real-time.
-      Robotics: Science and Systems Conference (RSS). Berkeley, CA, July 2014.
+    Robotics: Science and Systems Conference (RSS). Berkeley, CA, July 2014.
   </description>
 
   <maintainer email="jianhongxu1006@gmail.com">qintong</maintainer>
+  <author email="zhangji@cmu.edu">Ji Zhang</author>
 
   <license>BSD</license>
 
-  <author email="zhangji@cmu.edu">Ji Zhang</author>
-  
-  <buildtool_depend>catkin</buildtool_depend>
+  <!-- 构建工具依赖 -->
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <!-- 构建依赖 -->
   <build_depend>geometry_msgs</build_depend>
   <build_depend>nav_msgs</build_depend>
-  <build_depend>roscpp</build_depend>
-  <build_depend>rospy</build_depend>
-  <build_depend>std_msgs</build_depend>  
-  <build_depend>rosbag</build_depend>
   <build_depend>sensor_msgs</build_depend>
-  <build_depend>tf</build_depend>
+  <build_depend>std_msgs</build_depend>
+  <build_depend>tf2</build_depend>
+  <build_depend>tf2_ros</build_depend>
   <build_depend>image_transport</build_depend>
-  
-  <run_depend>geometry_msgs</run_depend>
-  <run_depend>nav_msgs</run_depend>
-  <run_depend>sensor_msgs</run_depend>
-  <run_depend>roscpp</run_depend>
-  <run_depend>rospy</run_depend>
-  <run_depend>std_msgs</run_depend>
-  <run_depend>rosbag</run_depend>
-  <run_depend>tf</run_depend>
-  <run_depend>image_transport</run_depend>
+  <build_depend>rosidl_default_generators</build_depend>
+  <build_depend>pcl_conversions</build_depend>
+  <build_depend>tf2_geometry_msgs</build_depend>
+  <build_depend>visualization_msgs</build_depend>
+  <build_depend>opencv4</build_depend>
+  <build_depend>gtsam</build_depend>
+  <!-- 执行依赖 -->
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>tf2</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>image_transport</exec_depend>
+  <exec_depend>rosidl_default_runtime</exec_depend>
+  <exec_depend>pcl_conversions</exec_depend>
+  <exec_depend>tf2_geometry_msgs</exec_depend>
+  <exec_depend>visualization_msgs</exec_depend>
+  <exec_depend>opencv4</exec_depend>
+  <exec_depend>gtsam</exec_depend>
+  <!-- 根据实际代码使用情况添加 rclcpp/rclpy 等依赖 -->
+  <build_depend>rclcpp</build_depend>
+  <exec_depend>rclcpp</exec_depend>
+  <!-- 如果有 Python 节点，则加 rclpy -->
+  <!-- <build_depend>rclpy</build_depend>
+  <exec_depend>rclpy</exec_depend> -->
 
-  <build_depend>message_generation</build_depend>
-  <run_depend>message_generation</run_depend>
-  <build_depend>message_runtime</build_depend>
-  <run_depend>message_runtime</run_depend>
+  <!-- 如果使用rosbag2功能，可以添加 -->
+  <build_depend>rosbag2_cpp</build_depend>
+  <exec_depend>rosbag2_cpp</exec_depend>
+
+  <member_of_group>rosidl_interface_packages</member_of_group>
 
   <export>
   </export>

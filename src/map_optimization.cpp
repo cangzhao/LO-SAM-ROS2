@@ -3,23 +3,43 @@
 // 将A-LOAM中的scan-to-scan的粗略激光里程计估计结果作为scan-to-map的初始值（原本的LIO-SAM采用的IMU预积分作为初始值）
 
 
-// ROS
-#include <ros/ros.h>
-#include <std_msgs/Header.h>
-#include <std_msgs/Float64MultiArray.h>
-#include <sensor_msgs/Imu.h>
-#include <sensor_msgs/PointCloud2.h>
-#include <sensor_msgs/NavSatFix.h>
-#include <nav_msgs/Odometry.h>
-#include <nav_msgs/Path.h>
-#include <visualization_msgs/Marker.h>
-#include <visualization_msgs/MarkerArray.h>
-#include <tf/LinearMath/Quaternion.h>
-#include <tf/transform_listener.h>
-#include <tf/transform_datatypes.h>
-#include <tf/transform_broadcaster.h>
+// ROS 2
+#include <rclcpp/rclcpp.hpp>
+
+#include <geometry_msgs/msg/pose_stamped.hpp>
+#include <nav_msgs/msg/path.hpp>
+#include <geometry_msgs/msg/transform_stamped.hpp>
+#include <geometry_msgs/msg/vector3.hpp>
+#include <geometry_msgs/msg/point.hpp>
+#include <geometry_msgs/msg/quaternion.hpp>
+#include <geometry_msgs/msg/pose.hpp>
+#include <geometry_msgs/msg/twist.hpp>
+
+#include <std_msgs/msg/header.hpp>
+#include <std_msgs/msg/float64_multi_array.hpp>
+
+#include <sensor_msgs/msg/imu.hpp>
+#include <sensor_msgs/msg/point_cloud2.hpp>
+#include <sensor_msgs/msg/nav_sat_fix.hpp>
+
+#include <nav_msgs/msg/odometry.hpp>
+#include <nav_msgs/msg/path.hpp>
+
+#include <visualization_msgs/msg/marker.hpp>
+#include <visualization_msgs/msg/marker_array.hpp>
+
+// TF2（ROS2中推荐使用tf2_ros而非tf）
+#include <tf2/LinearMath/Quaternion.h>
+#include <tf2_ros/transform_listener.h>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_broadcaster.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
+#include <tf2/LinearMath/Transform.h>      // tf2::Transform
+#include <tf2/LinearMath/Vector3.h>        // tf2::Vector3
+
 // OpenCV
 #include <opencv2/imgproc.hpp>
+
 // PCL
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
@@ -34,7 +54,8 @@
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/filters/crop_box.h>
 #include <pcl_conversions/pcl_conversions.h>
-// std
+
+// 标准库
 #include <vector>
 #include <cmath>
 #include <algorithm>
@@ -53,6 +74,9 @@
 #include <thread>
 #include <mutex>
 #include <chrono>
+#include <map>
+#include <memory>
+
 // GTSAM
 #include <gtsam/geometry/Rot3.h>
 #include <gtsam/geometry/Pose3.h>
@@ -67,10 +91,12 @@
 #include <gtsam/nonlinear/Values.h>
 #include <gtsam/inference/Symbol.h>
 #include <gtsam/nonlinear/ISAM2.h>
-// custom utility
+
+// 自定义工具
 #include "aloam_velodyne/common.h"
 #include "aloam_velodyne/tic_toc.h"
-#include <lo_sam/cloud_info.h>
+#include "lo_sam/msg/cloud_info.hpp"
+
 
 using namespace gtsam;
 
@@ -99,10 +125,11 @@ typedef PointXYZIRPYT PointTypePose;
 
 using FactorParam = Eigen::Matrix<double, 3, 4>;
 
-class Map_Optimization
-{
+class Map_Optimization: public rclcpp::Node
 
+{
 public:
+
     // gtsam
     NonlinearFactorGraph gtSAMgraph;
     Values initialEstimate;
@@ -111,29 +138,53 @@ public:
     Values isamCurrentEstimate;
     Eigen::MatrixXd poseCovariance;
 
-    ros::Publisher pubLaserCloudSurround;
-    ros::Publisher pubLaserOdometryGlobal;
-    ros::Publisher pubLaserOdometryIncremental;
-    ros::Publisher pubKeyPoses;
-    ros::Publisher pubPath;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudSurround;
+    rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubLaserOdometryGlobal;
+    rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubLaserOdometryIncremental;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubKeyPoses;
+    rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath;
 
-    ros::Publisher pubHistoryKeyFrames;
-    ros::Publisher pubIcpKeyFrames;
-    ros::Publisher pubRecentKeyFrames;
-    ros::Publisher pubRecentKeyFrame;
-    ros::Publisher pubCloudRegisteredRaw;
-    ros::Publisher pubLoopConstraintEdge;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubHistoryKeyFrames;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubIcpKeyFrames;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubRecentKeyFrames;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubRecentKeyFrame;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubCloudRegisteredRaw;
+    rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pubLoopConstraintEdge;
 
-    ros::Publisher pubRecentKeyFrame_corner;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubRecentKeyFrame_corner;
 
-    ros::Publisher pub_select_corner, pub_select_surf;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_select_corner;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_select_surf;
+  
+    std::string save_map_dir;
+    
+    rclcpp::Subscription<lo_sam::msg::CloudInfo>::SharedPtr odom_cloud_sub;
 
-    ros::Subscriber subCloud;
-    ros::Subscriber subGPS;
-    ros::Subscriber subLoop;
-    ros::ServiceServer srvSaveMap;
 
-    /**************************************************************************************/
+    std::deque<sensor_msgs::msg::PointCloud2::SharedPtr> edge_cloud_queue; // 存储边缘点云
+    std::deque<sensor_msgs::msg::PointCloud2::SharedPtr> surf_cloud_queue;  // 存储平面点云
+    std::deque<sensor_msgs::msg::PointCloud2::SharedPtr> full_cloud_queue;  // 存储全部点云
+    std::deque<nav_msgs::msg::Odometry::SharedPtr> odom_init_queue;;        // 存储初始里程计
+
+
+    std::mutex mutex; // 线程锁
+
+    // pcl存储点云
+    // pcl::VoxelGrid<pcl::PointXYZI> downSizeFilterCorner; // 将采样
+
+    pcl::PointCloud<PointType>::Ptr edge_cloud_curr; // 存储最新时刻的边缘点云
+    pcl::PointCloud<PointType>::Ptr surf_cloud_curr; // 存储最新时刻的平面点云
+
+    nav_msgs::msg::Odometry odom_init_curr; // 当前时刻的初始里程计
+
+    tf2::Transform tf_odom_last;
+
+    std::shared_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+
+    std::vector<gtsam::Symbol> X_node; // 用于存储里程计序号
+ 
+    int graph_pose_num = 0;
+
     // 配置参数
     bool loopClosureEnableFlag = true; // 是否开启回环检测
     double loopClosureFrequency = 1.0; // 回环检测频率
@@ -161,51 +212,20 @@ public:
     double mappingCornerLeafSize = 0.25;
     double mappingSurfLeafSize = 0.5;
     double surroundingKeyframeDensity = 2;
-  
-
-    std::string save_map_dir;
-
-    ros::NodeHandle nh_;
-
-    ros::Subscriber edge_cloud_sub, surf_cloud_sub, full_cloud_sub; // 边缘点云、平面点云、所有点云订阅者
-    ros::Subscriber odom_init_sub;                                  // 初始激光里程计订阅者
-
-    ros::Subscriber odom_cloud_sub;
 
 
-    std::deque<sensor_msgs::PointCloud2::ConstPtr> edge_cloud_queue; // 存储边缘点云
-    std::deque<sensor_msgs::PointCloud2::ConstPtr> surf_cloud_queue; // 存储平面点云
-    std::deque<sensor_msgs::PointCloud2::ConstPtr> full_cloud_queue; // 存储全部点云
-    std::deque<nav_msgs::Odometry::ConstPtr> odom_init_queue;        // 存储初始里程计
-
-
-    std::mutex mutex; // 线程锁
-
-    // pcl存储点云
-    // pcl::VoxelGrid<pcl::PointXYZI> downSizeFilterCorner; // 将采样
-
-    pcl::PointCloud<PointType>::Ptr edge_cloud_curr; // 存储最新时刻的边缘点云
-    pcl::PointCloud<PointType>::Ptr surf_cloud_curr; // 存储最新时刻的平面点云
-
-    nav_msgs::Odometry odom_init_curr; // 当前时刻的初始里程计
-
-    tf::Transform tf_odom_last;
-
-    std::vector<gtsam::Symbol> X_node; // 用于存储里程计序号
- 
-    int graph_pose_num = 0;
-
-
-
-    Map_Optimization(ros::NodeHandle &nh, ros::NodeHandle nh_private);
+    Map_Optimization(const rclcpp::NodeOptions & options = rclcpp::NodeOptions());
     ~Map_Optimization();
 
     void allocateMemory(); // 分配点云指针内存空间函数
 
+    void odom_cloud_handler(const std::shared_ptr<const lo_sam::msg::CloudInfo> & odom_cloud_msg);
 
-    void odom_cloud_handler(const lo_sam::cloud_info::ConstPtr &odom_cloud_msg); // 回调函数存储初始激光里程计
-
-    sensor_msgs::PointCloud2 publishCloud(ros::Publisher *thisPub, pcl::PointCloud<PointType>::Ptr thisCloud, ros::Time thisStamp, std::string thisFrame); // 发布点云
+    sensor_msgs::msg::PointCloud2 publishCloud(
+        const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr thisPub,
+        pcl::PointCloud<PointType>::Ptr thisCloud,
+        const rclcpp::Time & thisStamp,
+        const std::string & thisFrame);
 
     void updateInitialGuess();
 
@@ -265,11 +285,11 @@ public:
 
     /**************************************************************************************/
 
-    std::deque<nav_msgs::Odometry> gpsQueue;
+    std::deque<nav_msgs::msg::Odometry> gpsQueue;
     // LO_SAM::cloud_info cloudInfo;
 
-    vector<pcl::PointCloud<PointType>::Ptr> cornerCloudKeyFrames; // 历史所有关键帧的角点集合（降采样)
-    vector<pcl::PointCloud<PointType>::Ptr> surfCloudKeyFrames;   // 历史所有关键帧的平面点集合（降采样）
+    std::vector<pcl::PointCloud<PointType>::Ptr> cornerCloudKeyFrames; // 历史所有关键帧的角点集合（降采样)
+    std::vector<pcl::PointCloud<PointType>::Ptr> surfCloudKeyFrames;   // 历史所有关键帧的平面点集合（降采样）
 
     pcl::PointCloud<PointType>::Ptr cloudKeyPoses3D;     // 历史关键帧位姿（只有3D位置）
     pcl::PointCloud<PointTypePose>::Ptr cloudKeyPoses6D; // 历史关键帧位姿（6DOF）
@@ -294,7 +314,7 @@ public:
     std::vector<PointType> coeffSelSurfVec;
     std::vector<bool> laserCloudOriSurfFlag;
 
-    map<int, pair<pcl::PointCloud<PointType>, pcl::PointCloud<PointType>>> laserCloudMapContainer;
+    std::map<int, std::pair<pcl::PointCloud<PointType>, pcl::PointCloud<PointType>>> laserCloudMapContainer;
 
     pcl::PointCloud<PointType>::Ptr laserCloudCornerFromMap;   // 局部map的角点集合
     pcl::PointCloud<PointType>::Ptr laserCloudSurfFromMap;     // 局部map的平面点集合
@@ -314,7 +334,7 @@ public:
     pcl::VoxelGrid<PointType> downSizeFilterICP;
     pcl::VoxelGrid<PointType> downSizeFilterSurroundingKeyPoses; // for surrounding key poses of scan-to-map optimization
 
-    ros::Time timeLaserInfoStamp;
+    rclcpp::Time timeLaserInfoStamp;
     double timeLaserInfoCur;
 
     float transformTobeMapped[6]; // r, p, y, x, y, z
@@ -331,13 +351,13 @@ public:
     int laserCloudSurfLastDSNum = 0;      // 当前激光帧面点数量
 
     bool aLoopIsClosed = false;
-    map<int, int> loopIndexContainer; // from new to old
-    vector<pair<int, int>> loopIndexQueue;
-    vector<gtsam::Pose3> loopPoseQueue;
-    vector<gtsam::noiseModel::Diagonal::shared_ptr> loopNoiseQueue;
-    deque<std_msgs::Float64MultiArray> loopInfoVec;
+    std::map<int, int> loopIndexContainer; // from new to old
+    std::vector<std::pair<int, int>> loopIndexQueue;
+    std::vector<gtsam::Pose3> loopPoseQueue;
+    std::vector<gtsam::noiseModel::Diagonal::shared_ptr> loopNoiseQueue;
+    std::deque<std_msgs::msg::Float64MultiArray> loopInfoVec;
 
-    nav_msgs::Path globalPath;
+    nav_msgs::msg::Path globalPath;
 
     Eigen::Affine3f transPointAssociateToMap;       // 当前帧位姿
     Eigen::Affine3f incrementalOdometryAffineFront; // 前一帧位姿
@@ -380,84 +400,116 @@ public:
         }
     }
 
-    void visualize_factor(const std::vector<FactorParam> &param, const ros::Time &stamp, int color, const ros::Publisher &pub)
+    void visualize_factor(const std::vector<FactorParam> &param, const rclcpp::Time &stamp, int color, const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr &pub)
     {
         if (param.empty())
             return;
+
         static pcl::PointCloud<PointType> cloud;
-        static sensor_msgs::PointCloud2 msg;
+        static sensor_msgs::msg::PointCloud2 msg;
         cloud.clear();
-        if (pub.getNumSubscribers() > 0)
+
+        if (pub->get_subscription_count() > 0)
         {
             convert_factor_to_cloud(param, cloud, color);
             pcl::toROSMsg(cloud, msg);
             msg.header.frame_id = odometryFrame;
             msg.header.stamp = stamp;
-            pub.publish(msg);
+            pub->publish(msg);
         }
     }
 };
 
-Map_Optimization::Map_Optimization(ros::NodeHandle &nh, ros::NodeHandle nh_private)
+Map_Optimization::Map_Optimization(const rclcpp::NodeOptions & options)
+: Node("map_optimization_node", options)
 {
-    nh_ = nh;
+    declare_parameter<bool>("loopClosureEnableFlag", false);
+    declare_parameter<double>("loopClosureFrequency", 1.0);
+    declare_parameter<bool>("savePCD", false);
+    declare_parameter<int>("N_SCAN", 16);
+    declare_parameter<int>("Horizon_SCAN", 1800);
+    declare_parameter<double>("mappingProcessInterval", 0.15);
+    declare_parameter<double>("globalMapVisualizationSearchRadius", 1000.0);
+    declare_parameter<double>("globalMapVisualizationPoseDensity", 15.0);
+    declare_parameter<double>("globalMapVisualizationLeafSize", 1.5);
+    declare_parameter<std::string>("odometryFrame", "camera_init");
+    declare_parameter<int>("surroundingKeyframeSize", 1800);
+    declare_parameter<int>("surroundingKeyframeSearchRadius", 50);
+    declare_parameter<int>("edgeFeatureMinValidNum", 10);
+    declare_parameter<int>("surfFeatureMinValidNum", 200);
+    declare_parameter<double>("z_tollerance", 100.0);
+    declare_parameter<double>("rotation_tollerance", 100.0);
+    declare_parameter<int>("historyKeyframeSearchNum", 15);
+    declare_parameter<double>("surroundingkeyframeAddingAngleThreshold", 1.5);
+    declare_parameter<double>("historyKeyframeSearchRadius", 15.0);
+    declare_parameter<double>("historyKeyframeSearchTimeDiff", 1000.0);
+    declare_parameter<double>("surroundingkeyframeAddingDistThreshold", 1.5);
+    declare_parameter<double>("historyKeyframeFitnessScore", 0.5);
+    declare_parameter<double>("odometrySurfLeafSize", 0.5);
+    declare_parameter<double>("mappingCornerLeafSize", 0.2);
+    declare_parameter<double>("mappingSurfLeafSize", 0.4);
+    declare_parameter<double>("surroundingKeyframeDensity", 2.0);
 
     // 设置参数
-    nh.param<bool>("loopClosureEnableFlag", loopClosureEnableFlag, false); // 是否开启回环检测
-    nh.param<double>("loopClosureFrequency", loopClosureFrequency, 1.0);   //  回环检测频率
-    nh.param<bool>("savePCD", savePCD, false);                             // 是否保存点云地图
-    nh.param<int>("N_SCAN", N_SCAN, 16);
-    nh.param<int>("Horizon_SCAN", Horizon_SCAN, 1800);
-    nh.param<double>("mappingProcessInterval", mappingProcessInterval, 0.15);                         //
-    nh.param<double>("globalMapVisualizationSearchRadius", globalMapVisualizationSearchRadius, 1000); //
-    nh.param<double>("globalMapVisualizationPoseDensity", globalMapVisualizationPoseDensity, 15);     //
-    nh.param<double>("globalMapVisualizationLeafSize", globalMapVisualizationLeafSize, 1.5);          //
-    nh.param<std::string>("odometryFrame", odometryFrame, "camera_init");                             //
-    nh.param<int>("surroundingKeyframeSize", surroundingKeyframeSize, 1800);
-    nh.param<int>("surroundingKeyframeSearchRadius", surroundingKeyframeSearchRadius, 50);
-    nh.param<int>("edgeFeatureMinValidNum", edgeFeatureMinValidNum, 10);
-    nh.param<int>("surfFeatureMinValidNum", surfFeatureMinValidNum, 200);
-    nh.param<double>("z_tollerance", z_tollerance, 100);                                                       //
-    nh.param<double>("rotation_tollerance", rotation_tollerance, 100);                                         //
-    nh.param<int>("historyKeyframeSearchNum", historyKeyframeSearchNum, 15);                                   //
-    nh.param<double>("surroundingkeyframeAddingAngleThreshold", surroundingkeyframeAddingAngleThreshold, 1.5); //
-    nh.param<double>("historyKeyframeSearchRadius", historyKeyframeSearchRadius, 15);                          //
-    nh.param<double>("historyKeyframeSearchTimeDiff", historyKeyframeSearchTimeDiff, 1000);                    //
-    nh.param<double>("surroundingkeyframeAddingDistThreshold", surroundingkeyframeAddingDistThreshold, 1.5);   //
-    nh.param<double>("historyKeyframeFitnessScore", historyKeyframeFitnessScore, 0.5);                         //
-    nh.param<double>("odometrySurfLeafSize", odometrySurfLeafSize, 0.5);                                       //
-    nh.param<double>("mappingCornerLeafSize", mappingCornerLeafSize, 0.2);                                     //
-    nh.param<double>("mappingSurfLeafSize", mappingSurfLeafSize, 0.4);                                         //
-    nh.param<double>("surroundingKeyframeDensity", surroundingKeyframeDensity, 2);                             //
+    get_parameter("loopClosureEnableFlag", loopClosureEnableFlag);
+    get_parameter("loopClosureFrequency", loopClosureFrequency);
+    get_parameter("savePCD", savePCD);
+    get_parameter("N_SCAN", N_SCAN);
+    get_parameter("Horizon_SCAN", Horizon_SCAN);
+    get_parameter("mappingProcessInterval", mappingProcessInterval);
+    get_parameter("globalMapVisualizationSearchRadius", globalMapVisualizationSearchRadius);
+    get_parameter("globalMapVisualizationPoseDensity", globalMapVisualizationPoseDensity);
+    get_parameter("globalMapVisualizationLeafSize", globalMapVisualizationLeafSize);
+    get_parameter("odometryFrame", odometryFrame);
+    get_parameter("surroundingKeyframeSize", surroundingKeyframeSize);
+    get_parameter("surroundingKeyframeSearchRadius", surroundingKeyframeSearchRadius);
+    get_parameter("edgeFeatureMinValidNum", edgeFeatureMinValidNum);
+    get_parameter("surfFeatureMinValidNum", surfFeatureMinValidNum);
+    get_parameter("z_tollerance", z_tollerance);
+    get_parameter("rotation_tollerance", rotation_tollerance);
+    get_parameter("historyKeyframeSearchNum", historyKeyframeSearchNum);
+    get_parameter("surroundingkeyframeAddingAngleThreshold", surroundingkeyframeAddingAngleThreshold);
+    get_parameter("historyKeyframeSearchRadius", historyKeyframeSearchRadius);
+    get_parameter("historyKeyframeSearchTimeDiff", historyKeyframeSearchTimeDiff);
+    get_parameter("surroundingkeyframeAddingDistThreshold", surroundingkeyframeAddingDistThreshold);
+    get_parameter("historyKeyframeFitnessScore", historyKeyframeFitnessScore);
+    get_parameter("odometrySurfLeafSize", odometrySurfLeafSize);
+    get_parameter("mappingCornerLeafSize", mappingCornerLeafSize);
+    get_parameter("mappingSurfLeafSize", mappingSurfLeafSize);
+    get_parameter("surroundingKeyframeDensity", surroundingKeyframeDensity);                             //
 
 
     ISAM2Params parameters;
     parameters.relinearizeThreshold = 0.1;
     parameters.relinearizeSkip = 1;
     isam = new ISAM2(parameters);
+    tf_broadcaster_ = std::make_shared<tf2_ros::TransformBroadcaster>(this);
 
     // 订阅者初始化，消息均来源于laserOdometry
-    odom_cloud_sub = nh.subscribe<lo_sam::cloud_info>("odom_init/odom_cloud", 100, &Map_Optimization::odom_cloud_handler, this); // 订阅初始激光里程计
+    odom_cloud_sub = this->create_subscription<lo_sam::msg::CloudInfo>(
+        "odom_init/odom_cloud", 
+        rclcpp::QoS(100),
+        std::bind(&Map_Optimization::odom_cloud_handler, this, std::placeholders::_1)); // 订阅初始激光里程计
 
 
-    pubKeyPoses = nh.advertise<sensor_msgs::PointCloud2>("mapping/trajectory", 1);                     // 发布历史关键帧里程计
-    pubLaserCloudSurround = nh.advertise<sensor_msgs::PointCloud2>("mapping/map_global", 1);           // 发布局部关键帧map的特征点云
-    pubLaserOdometryGlobal = nh.advertise<nav_msgs::Odometry>("mapping/odometry", 1);                  // 发布激光里程计，rviz中表现为坐标轴
-    pubLaserOdometryIncremental = nh.advertise<nav_msgs::Odometry>("mapping/odometry_incremental", 1); // 发布激光里程计，它与上面的激光里程计基本一样，只是roll、pitch用imu数据加权平均了一下，z做了限制
-    pubPath = nh.advertise<nav_msgs::Path>("mapping/path", 1);                                         // 发布激光里程计路径，rviz中表现为载体的运行轨迹
+    pubKeyPoses = this->create_publisher<sensor_msgs::msg::PointCloud2>("mapping/trajectory", 1);                     // 发布历史关键帧里程计
+    pubLaserCloudSurround = this->create_publisher<sensor_msgs::msg::PointCloud2>("mapping/map_global", 1);           // 发布局部关键帧map的特征点云
+    pubLaserOdometryGlobal = this->create_publisher<nav_msgs::msg::Odometry>("mapping/odometry", 1);
+    pubLaserOdometryIncremental = this->create_publisher<nav_msgs::msg::Odometry>("mapping/odometry_incremental", 1);
+    pubPath = this->create_publisher<nav_msgs::msg::Path>("mapping/path", 1);
 
-    pubHistoryKeyFrames = nh.advertise<sensor_msgs::PointCloud2>("mapping/icp_loop_closure_history_cloud", 1);    // 发布闭环匹配关键帧局部map
-    pubIcpKeyFrames = nh.advertise<sensor_msgs::PointCloud2>("mapping/icp_loop_closure_corrected_cloud", 1);      // 发布当前关键帧经过闭环优化后的位姿变换之后的特征点云
-    pubLoopConstraintEdge = nh.advertise<visualization_msgs::MarkerArray>("mapping/loop_closure_constraints", 1); // 发布闭环边，rviz中表现为闭环帧之间的连线
+    pubHistoryKeyFrames = this->create_publisher<sensor_msgs::msg::PointCloud2>("mapping/icp_loop_closure_history_cloud", 1);
+    pubIcpKeyFrames = this->create_publisher<sensor_msgs::msg::PointCloud2>("mapping/icp_loop_closure_corrected_cloud", 1);
+    pubLoopConstraintEdge = this->create_publisher<visualization_msgs::msg::MarkerArray>("mapping/loop_closure_constraints", 1);
 
-    pubRecentKeyFrames = nh.advertise<sensor_msgs::PointCloud2>("mapping/map_local", 1);               // 发布局部map的降采样平面点集合
-    pubRecentKeyFrame = nh.advertise<sensor_msgs::PointCloud2>("mapping/cloud_registered", 1);         // 发布历史帧（累加的）的角点、平面点降采样集合
-    pubCloudRegisteredRaw = nh.advertise<sensor_msgs::PointCloud2>("mapping/cloud_registered_raw", 1); // 发布当前帧原始点云配准之后的点云
+    pubRecentKeyFrames = this->create_publisher<sensor_msgs::msg::PointCloud2>("mapping/map_local", 1);
+    pubRecentKeyFrame = this->create_publisher<sensor_msgs::msg::PointCloud2>("mapping/cloud_registered", 1);
+    pubCloudRegisteredRaw = this->create_publisher<sensor_msgs::msg::PointCloud2>("mapping/cloud_registered_raw", 1);
 
-    pubRecentKeyFrame_corner = nh.advertise<sensor_msgs::PointCloud2>("mapping/cloud_registered_corner", 1); // 发布历史帧（累加的）的角点降采样集合
+    pubRecentKeyFrame_corner = this->create_publisher<sensor_msgs::msg::PointCloud2>("mapping/cloud_registered_corner", 1);
 
-    pub_select_corner = nh.advertise<sensor_msgs::PointCloud2>("select_corner", 3);
-    pub_select_surf = nh.advertise<sensor_msgs::PointCloud>("select_surf", 3);
+    pub_select_corner = this->create_publisher<sensor_msgs::msg::PointCloud2>("select_corner", 3);
+    pub_select_surf = this->create_publisher<sensor_msgs::msg::PointCloud2>("select_surf", 3);
 
     downSizeFilterCorner.setLeafSize(mappingCornerLeafSize, mappingCornerLeafSize, mappingCornerLeafSize);
     downSizeFilterSurf.setLeafSize(mappingSurfLeafSize, mappingSurfLeafSize, mappingSurfLeafSize);
@@ -523,16 +575,17 @@ void Map_Optimization::allocateMemory()
     surf_cloud_curr.reset(new pcl::PointCloud<PointType>());
 }
 
-void Map_Optimization::odom_cloud_handler(const lo_sam::cloud_info::ConstPtr &odom_cloud_msg)
+void Map_Optimization::odom_cloud_handler(const std::shared_ptr<const lo_sam::msg::CloudInfo> & odom_cloud_msg)
 {
     pcl::fromROSMsg(odom_cloud_msg->cloud_edge, *laserCloudCornerLast);
-    pcl::fromROSMsg(odom_cloud_msg->cloud_edge, *laserCloudSurfLast);
+    pcl::fromROSMsg(odom_cloud_msg->cloud_surf, *laserCloudSurfLast);
 
     // laserCloudCornerLast = odom_cloud_msg.;
     // laserCloudSurfLast = surf_cloud_curr;
 
-    timeLaserInfoStamp = odom_cloud_msg->header.stamp;
-    timeLaserInfoCur = odom_cloud_msg->header.stamp.toSec();
+    timeLaserInfoStamp = rclcpp::Time(odom_cloud_msg->header.stamp);
+    timeLaserInfoCur = timeLaserInfoStamp.seconds();
+
 
     odom_init_curr = odom_cloud_msg->odom_init;
 
@@ -542,14 +595,14 @@ void Map_Optimization::odom_cloud_handler(const lo_sam::cloud_info::ConstPtr &od
     // mapping执行频率控制
 
     static double timeLastProcessing = -1;
-    static int laser_num = 0;
 
     // std::cout << "time diff:" << timeLaserInfoCur - timeLastProcessing << std::endl;
 
     if (timeLaserInfoCur - timeLastProcessing >= mappingProcessInterval)
     {
         timeLastProcessing = timeLaserInfoCur;
-        ros::Time t1 = ros::Time::now();
+        auto clock = this->get_clock();
+        rclcpp::Time t1 = clock->now();
         // 1.当前帧位姿初始化： 采用来自laserOdometry的初始激光里程计来初始位姿
         updateInitialGuess();
 
@@ -598,21 +651,26 @@ void Map_Optimization::odom_cloud_handler(const lo_sam::cloud_info::ConstPtr &od
         // (3)发布历史帧（累加的）的角点、平面点降采样集合
         // (4)发布里程计轨迹
         publishFrames();
-        ros::Time t2 = ros::Time::now();
-        // std::cout << "mapping takes: " << (t2 - t1).toSec() * 1000 << "ms\n"
-        //           << std::endl;
-        //     laser_num++;
+        rclcpp::Time t2 = this->now();
     }
 }
 
-sensor_msgs::PointCloud2 Map_Optimization::publishCloud(ros::Publisher *thisPub, pcl::PointCloud<PointType>::Ptr thisCloud, ros::Time thisStamp, std::string thisFrame)
+sensor_msgs::msg::PointCloud2 Map_Optimization::publishCloud(
+    const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr thisPub,
+    const pcl::PointCloud<PointType>::Ptr thisCloud,
+    const rclcpp::Time & thisStamp,
+    const std::string & thisFrame)
 {
-    sensor_msgs::PointCloud2 tempCloud;
+    sensor_msgs::msg::PointCloud2 tempCloud;
     pcl::toROSMsg(*thisCloud, tempCloud);
+
     tempCloud.header.stamp = thisStamp;
     tempCloud.header.frame_id = thisFrame;
-    if (thisPub->getNumSubscribers() != 0)
+
+    if (thisPub && thisPub->get_subscription_count() > 0) {
         thisPub->publish(tempCloud);
+    }
+
     return tempCloud;
 }
 
@@ -635,24 +693,24 @@ void Map_Optimization::updateInitialGuess()
         transformTobeMapped[1] = eular(1);                                 // pitch
         transformTobeMapped[2] = eular(0);                                 // yaw
 
-        tf_odom_last.setOrigin(tf::Vector3(odom_init_t(0), odom_init_t(1), odom_init_t(2)));
-        tf_odom_last.setRotation(tf::Quaternion(odom_init_q.x(), odom_init_q.y(), odom_init_q.z(), odom_init_q.w()));
+        tf_odom_last.setOrigin(tf2::Vector3(odom_init_t(0), odom_init_t(1), odom_init_t(2)));
+        tf_odom_last.setRotation(tf2::Quaternion(odom_init_q.x(), odom_init_q.y(), odom_init_q.z(), odom_init_q.w()));
         return;
     }
 
-    tf::Transform tf_odom_curr;
-    tf_odom_curr.setOrigin(tf::Vector3(odom_init_t(0), odom_init_t(1), odom_init_t(2)));
-    tf_odom_curr.setRotation(tf::Quaternion(odom_init_q.x(), odom_init_q.y(), odom_init_q.z(), odom_init_q.w()));
+    tf2::Transform tf_odom_curr;
+    tf_odom_curr.setOrigin(tf2::Vector3(odom_init_t(0), odom_init_t(1), odom_init_t(2)));
+    tf_odom_curr.setRotation(tf2::Quaternion(odom_init_q.x(), odom_init_q.y(), odom_init_q.z(), odom_init_q.w()));
 
-    tf::Transform tf_odom_increment = tf_odom_last.inverse() * tf_odom_curr;
+    tf2::Transform tf_odom_increment = tf_odom_last.inverse() * tf_odom_curr;
 
-    tf::Transform tf_odom_mapped_last;
-    tf_odom_mapped_last.setOrigin(tf::Vector3(transformTobeMapped[3], transformTobeMapped[4], transformTobeMapped[5]));
-    tf::Quaternion q;
+    tf2::Transform tf_odom_mapped_last;
+    tf_odom_mapped_last.setOrigin(tf2::Vector3(transformTobeMapped[3], transformTobeMapped[4], transformTobeMapped[5]));
+    tf2::Quaternion q;
     q.setRPY(transformTobeMapped[0], transformTobeMapped[1], transformTobeMapped[2]);
     tf_odom_mapped_last.setRotation(q);
 
-    tf::Transform tf_odom_mapped_curr = tf_odom_mapped_last * tf_odom_increment;
+    tf2::Transform tf_odom_mapped_curr = tf_odom_mapped_last * tf_odom_increment;
     Eigen::Quaterniond q_curr(tf_odom_mapped_curr.getRotation().w(), tf_odom_mapped_curr.getRotation().x(),
                               tf_odom_mapped_curr.getRotation().y(), tf_odom_mapped_curr.getRotation().z());
 
@@ -858,7 +916,7 @@ void Map_Optimization::extractCloud(pcl::PointCloud<PointType>::Ptr cloudToExtra
             // 加入局部map
             *laserCloudCornerFromMap += laserCloudCornerTemp;
             *laserCloudSurfFromMap += laserCloudSurfTemp;
-            laserCloudMapContainer[thisKeyInd] = make_pair(laserCloudCornerTemp, laserCloudSurfTemp);
+            laserCloudMapContainer[thisKeyInd] = std::make_pair(laserCloudCornerTemp, laserCloudSurfTemp);
         }
     }
 
@@ -953,7 +1011,7 @@ void Map_Optimization::scan2MapOptimization()
     }
     else
     {
-        ROS_WARN("Not enough features! Only %d edge and %d planar features available.", laserCloudCornerLastDSNum, laserCloudSurfLastDSNum);
+        RCLCPP_WARN(this->get_logger(), "Not enough features! Only %d edge and %d planar features available.", laserCloudCornerLastDSNum, laserCloudSurfLastDSNum);
     }
 }
 
@@ -1606,14 +1664,15 @@ void Map_Optimization::addLoopFactor()
 void Map_Optimization::updatePath(const PointTypePose &pose_in)
 {
 
-    geometry_msgs::PoseStamped pose_stamped;
-    pose_stamped.header.stamp = ros::Time().fromSec(pose_in.time);
+    geometry_msgs::msg::PoseStamped pose_stamped;
+    pose_stamped.header.stamp = rclcpp::Time(pose_in.time * 1e9); // pose_in.time为秒，乘nanosec
 
     pose_stamped.header.frame_id = odometryFrame;
     pose_stamped.pose.position.x = pose_in.x;
     pose_stamped.pose.position.y = pose_in.y;
     pose_stamped.pose.position.z = pose_in.z;
-    tf::Quaternion q = tf::createQuaternionFromRPY(pose_in.roll, pose_in.pitch, pose_in.yaw);
+    tf2::Quaternion q;
+    q.setRPY(pose_in.roll, pose_in.pitch, pose_in.yaw);  // 设置旋转角，顺序为 roll, pitch, yaw
     pose_stamped.pose.orientation.x = q.x();
     pose_stamped.pose.orientation.y = q.y();
     pose_stamped.pose.orientation.z = q.z();
@@ -1665,27 +1724,36 @@ void Map_Optimization::publishOdometry()
 {
     // Publish odometry for ROS (global)
     // 发布激光里程计，odom等价map
-    nav_msgs::Odometry laserOdometryROS;
+    nav_msgs::msg::Odometry laserOdometryROS;
     laserOdometryROS.header.stamp = timeLaserInfoStamp;
     laserOdometryROS.header.frame_id = odometryFrame;
     laserOdometryROS.child_frame_id = "odom_mapping";
     laserOdometryROS.pose.pose.position.x = transformTobeMapped[3];
     laserOdometryROS.pose.pose.position.y = transformTobeMapped[4];
     laserOdometryROS.pose.pose.position.z = transformTobeMapped[5];
-    laserOdometryROS.pose.pose.orientation = tf::createQuaternionMsgFromRollPitchYaw(transformTobeMapped[0], transformTobeMapped[1], transformTobeMapped[2]);
-    pubLaserOdometryGlobal.publish(laserOdometryROS);
+    tf2::Quaternion q;
+    q.setRPY(transformTobeMapped[0], transformTobeMapped[1], transformTobeMapped[2]);
+    laserOdometryROS.pose.pose.orientation = tf2::toMsg(q);
+    pubLaserOdometryGlobal->publish(laserOdometryROS);
 
     // Publish TF
     // 发布TF，odom->lidar
-    static tf::TransformBroadcaster br;
-    tf::Transform t_odom_to_lidar = tf::Transform(tf::createQuaternionFromRPY(transformTobeMapped[0], transformTobeMapped[1], transformTobeMapped[2]),
-                                                  tf::Vector3(transformTobeMapped[3], transformTobeMapped[4], transformTobeMapped[5]));
-    tf::StampedTransform trans_odom_to_lidar = tf::StampedTransform(t_odom_to_lidar, timeLaserInfoStamp, odometryFrame, "base_link");
-    br.sendTransform(trans_odom_to_lidar);
+
+    geometry_msgs::msg::TransformStamped trans_odom_to_lidar;
+    trans_odom_to_lidar.header.stamp = timeLaserInfoStamp;
+    trans_odom_to_lidar.header.frame_id = odometryFrame;
+    trans_odom_to_lidar.child_frame_id = "base_link";
+
+    trans_odom_to_lidar.transform.translation.x = transformTobeMapped[3];
+    trans_odom_to_lidar.transform.translation.y = transformTobeMapped[4];
+    trans_odom_to_lidar.transform.translation.z = transformTobeMapped[5];
+    trans_odom_to_lidar.transform.rotation = tf2::toMsg(q);
+
+    tf_broadcaster_->sendTransform(trans_odom_to_lidar);
 
     // Publish odometry for ROS (incremental)
     static bool lastIncreOdomPubFlag = false;
-    static nav_msgs::Odometry laserOdomIncremental; // incremental odometry msg
+    static nav_msgs::msg::Odometry laserOdomIncremental; // incremental odometry msg
     static Eigen::Affine3f increOdomAffine;         // incremental odometry in affine
     // 第一次数据直接用全局里程计初始化
     if (lastIncreOdomPubFlag == false)
@@ -1696,46 +1764,27 @@ void Map_Optimization::publishOdometry()
     }
     else
     {
-        // 当前帧与前一帧之间的位姿变换
         Eigen::Affine3f affineIncre = incrementalOdometryAffineFront.inverse() * incrementalOdometryAffineBack;
         increOdomAffine = increOdomAffine * affineIncre;
+
         float x, y, z, roll, pitch, yaw;
         pcl::getTranslationAndEulerAngles(increOdomAffine, x, y, z, roll, pitch, yaw);
-        /* if (cloudInfo.imuAvailable == true)
-         {
-             if (std::abs(cloudInfo.imuPitchInit) < 1.4)
-             {
-                 double imuWeight = 0.1;
-                 tf::Quaternion imuQuaternion;
-                 tf::Quaternion transformQuaternion;
-                 double rollMid, pitchMid, yawMid;
 
-                 // slerp roll
-                 transformQuaternion.setRPY(roll, 0, 0);
-                 imuQuaternion.setRPY(cloudInfo.imuRollInit, 0, 0);
-                 tf::Matrix3x3(transformQuaternion.slerp(imuQuaternion, imuWeight)).getRPY(rollMid, pitchMid, yawMid);
-                 roll = rollMid;
-
-                 // slerp pitch
-                 transformQuaternion.setRPY(0, pitch, 0);
-                 imuQuaternion.setRPY(0, cloudInfo.imuPitchInit, 0);
-                 tf::Matrix3x3(transformQuaternion.slerp(imuQuaternion, imuWeight)).getRPY(rollMid, pitchMid, yawMid);
-                 pitch = pitchMid;
-             }
-         }*/
         laserOdomIncremental.header.stamp = timeLaserInfoStamp;
         laserOdomIncremental.header.frame_id = odometryFrame;
         laserOdomIncremental.child_frame_id = "odom_mapping";
+
         laserOdomIncremental.pose.pose.position.x = x;
         laserOdomIncremental.pose.pose.position.y = y;
         laserOdomIncremental.pose.pose.position.z = z;
-        laserOdomIncremental.pose.pose.orientation = tf::createQuaternionMsgFromRollPitchYaw(roll, pitch, yaw);
-        if (isDegenerate)
-            laserOdomIncremental.pose.covariance[0] = 1;
-        else
-            laserOdomIncremental.pose.covariance[0] = 0;
+
+        tf2::Quaternion q_incre;
+        q_incre.setRPY(roll, pitch, yaw);
+        laserOdomIncremental.pose.pose.orientation = tf2::toMsg(q_incre);
+
+        laserOdomIncremental.pose.covariance[0] = isDegenerate ? 1.0 : 0.0;
     }
-    pubLaserOdometryIncremental.publish(laserOdomIncremental);
+    pubLaserOdometryIncremental->publish(laserOdomIncremental);
 }
 
 // 发布里程计、点云、轨迹
@@ -1749,29 +1798,29 @@ void Map_Optimization::publishFrames()
     if (cloudKeyPoses3D->points.empty())
         return;
     // publish key poses
-    publishCloud(&pubKeyPoses, cloudKeyPoses3D, timeLaserInfoStamp, odometryFrame);
+    publishCloud(pubKeyPoses, cloudKeyPoses3D, timeLaserInfoStamp, odometryFrame);
     // Publish surrounding key frames
-    publishCloud(&pubRecentKeyFrames, laserCloudSurfFromMapDS, timeLaserInfoStamp, odometryFrame);
+    publishCloud(pubRecentKeyFrames, laserCloudSurfFromMapDS, timeLaserInfoStamp, odometryFrame);
     // publish registered key frame
 
-    if (pubRecentKeyFrame.getNumSubscribers() != 0)
+    if (pubRecentKeyFrame->get_subscription_count() != 0)
     {
         pcl::PointCloud<PointType>::Ptr cloudOut(new pcl::PointCloud<PointType>());
         PointTypePose thisPose6D = trans2PointTypePose(transformTobeMapped);
         *cloudOut += *transformPointCloud(laserCloudCornerLastDS, &thisPose6D);
         *cloudOut += *transformPointCloud(laserCloudSurfLastDS, &thisPose6D);
-        publishCloud(&pubRecentKeyFrame, cloudOut, timeLaserInfoStamp, odometryFrame);
+        publishCloud(pubRecentKeyFrame, cloudOut, timeLaserInfoStamp, odometryFrame);
     }
-    if (pubRecentKeyFrame_corner.getNumSubscribers() != 0)
+    if (pubRecentKeyFrame_corner->get_subscription_count() != 0)
     {
         PointTypePose thisPose6D = trans2PointTypePose(transformTobeMapped);
         pcl::PointCloud<PointType>::Ptr corner_cloudOut(new pcl::PointCloud<PointType>());
         corner_cloudOut = transformPointCloud(laserCloudCornerLastDS, &thisPose6D);
         // 发布边缘点集合（累积）
-        publishCloud(&pubRecentKeyFrame_corner, corner_cloudOut, timeLaserInfoStamp, odometryFrame);
+        publishCloud(pubRecentKeyFrame_corner, corner_cloudOut, timeLaserInfoStamp, odometryFrame);
     }
     // publish registered high-res raw cloud
-    if (pubCloudRegisteredRaw.getNumSubscribers() != 0)
+    if (pubCloudRegisteredRaw->get_subscription_count() != 0)
     {
         // pcl::PointCloud<PointType>::Ptr cloudOut(new pcl::PointCloud<PointType>());
         // pcl::fromROSMsg(cloudInfo.cloud_deskewed, *cloudOut);
@@ -1780,11 +1829,11 @@ void Map_Optimization::publishFrames()
         // publishCloud(&pubCloudRegisteredRaw, cloudOut, timeLaserInfoStamp, odometryFrame);
     }
     // publish path
-    if (pubPath.getNumSubscribers() != 0)
+    if (pubPath->get_subscription_count() != 0)
     {
         globalPath.header.stamp = timeLaserInfoStamp;
         globalPath.header.frame_id = odometryFrame;
-        pubPath.publish(globalPath);
+        pubPath->publish(globalPath);
     }
 }
 
@@ -1863,8 +1912,8 @@ void Map_Optimization::loopClosureThread()
     if (loopClosureEnableFlag == false)
         return;
 
-    ros::Rate rate(loopClosureFrequency);
-    while (ros::ok())
+    rclcpp::Rate rate(loopClosureFrequency);
+    while (rclcpp::ok())
     {
         rate.sleep();
         performLoopClosure();
@@ -1905,8 +1954,8 @@ void Map_Optimization::performLoopClosure()
         loopFindNearKeyframes(prevKeyframeCloud, loopKeyPre, historyKeyframeSearchNum);
         if (cureKeyframeCloud->size() < 300 || prevKeyframeCloud->size() < 1000)
             return;
-        if (pubHistoryKeyFrames.getNumSubscribers() != 0)
-            publishCloud(&pubHistoryKeyFrames, prevKeyframeCloud, timeLaserInfoStamp, odometryFrame);
+        if (pubHistoryKeyFrames->get_subscription_count() != 0)
+            publishCloud(pubHistoryKeyFrames, prevKeyframeCloud, timeLaserInfoStamp, odometryFrame);
     }
 
     // ICP Settings
@@ -1930,11 +1979,11 @@ void Map_Optimization::performLoopClosure()
 
     // publish corrected cloud
     // 发布当前关键帧经过闭环优化后的位姿变换之后的特征点云
-    if (pubIcpKeyFrames.getNumSubscribers() != 0)
+    if (pubIcpKeyFrames->get_subscription_count() != 0)
     {
         pcl::PointCloud<PointType>::Ptr closed_cloud(new pcl::PointCloud<PointType>());
         pcl::transformPointCloud(*cureKeyframeCloud, *closed_cloud, icp.getFinalTransformation());
-        publishCloud(&pubIcpKeyFrames, closed_cloud, timeLaserInfoStamp, odometryFrame);
+        publishCloud(pubIcpKeyFrames, closed_cloud, timeLaserInfoStamp, odometryFrame);
     }
 
     // Get pose transformation
@@ -1964,7 +2013,7 @@ void Map_Optimization::performLoopClosure()
     // 添加闭环因子需要的数据
     // 这些内容会在函数addLoopFactor中用到
     mtx.lock();
-    loopIndexQueue.push_back(make_pair(loopKeyCur, loopKeyPre));
+    loopIndexQueue.push_back(std::make_pair(loopKeyCur, loopKeyPre));
     loopPoseQueue.push_back(poseFrom.between(poseTo));
     loopNoiseQueue.push_back(constraintNoise);
     mtx.unlock();
@@ -1979,13 +2028,13 @@ void Map_Optimization::visualizeLoopClosure()
     if (loopIndexContainer.empty())
         return;
 
-    visualization_msgs::MarkerArray markerArray;
+    visualization_msgs::msg::MarkerArray markerArray;
     // loop nodes
-    visualization_msgs::Marker markerNode;
+    visualization_msgs::msg::Marker markerNode;
     markerNode.header.frame_id = odometryFrame;
     markerNode.header.stamp = timeLaserInfoStamp;
-    markerNode.action = visualization_msgs::Marker::ADD;
-    markerNode.type = visualization_msgs::Marker::SPHERE_LIST;
+    markerNode.action = visualization_msgs::msg::Marker::ADD;
+    markerNode.type = visualization_msgs::msg::Marker::SPHERE_LIST;
     markerNode.ns = "loop_nodes";
     markerNode.id = 0;
     markerNode.pose.orientation.w = 1;
@@ -1997,11 +2046,11 @@ void Map_Optimization::visualizeLoopClosure()
     markerNode.color.b = 1;
     markerNode.color.a = 1;
     // loop edges
-    visualization_msgs::Marker markerEdge;
+    visualization_msgs::msg::Marker markerEdge;
     markerEdge.header.frame_id = odometryFrame;
     markerEdge.header.stamp = timeLaserInfoStamp;
-    markerEdge.action = visualization_msgs::Marker::ADD;
-    markerEdge.type = visualization_msgs::Marker::LINE_LIST;
+    markerEdge.action = visualization_msgs::msg::Marker::ADD;
+    markerEdge.type = visualization_msgs::msg::Marker::LINE_LIST;
     markerEdge.ns = "loop_edges";
     markerEdge.id = 1;
     markerEdge.pose.orientation.w = 1;
@@ -2015,7 +2064,7 @@ void Map_Optimization::visualizeLoopClosure()
     {
         int key_cur = it->first;
         int key_pre = it->second;
-        geometry_msgs::Point p;
+        geometry_msgs::msg::Point p;
         p.x = copy_cloudKeyPoses6D->points[key_cur].x;
         p.y = copy_cloudKeyPoses6D->points[key_cur].y;
         p.z = copy_cloudKeyPoses6D->points[key_cur].z;
@@ -2030,7 +2079,7 @@ void Map_Optimization::visualizeLoopClosure()
 
     markerArray.markers.push_back(markerNode);
     markerArray.markers.push_back(markerEdge);
-    pubLoopConstraintEdge.publish(markerArray);
+    pubLoopConstraintEdge->publish(markerArray);
 }
 
 // 在历史关键帧中查找与当前关键帧距离最近的关键帧集合，选择时间相隔较远的一帧作为候选闭环帧
@@ -2162,8 +2211,8 @@ void Map_Optimization::visualizeGlobalMapThread()
     // 1、发布局部关键帧map的特征点云
     // 2、保存全局关键帧特征点集合
 
-    ros::Rate rate(0.2);
-    while (ros::ok())
+    rclcpp::Rate rate(0.2);
+    while (rclcpp::ok())
     {
         rate.sleep();
         publishGlobalMap();
@@ -2184,7 +2233,7 @@ void Map_Optimization::visualizeGlobalMapThread()
 // 发布局部关键帧map的特征点云
 void Map_Optimization::publishGlobalMap()
 {
-    if (pubLaserCloudSurround.getNumSubscribers() == 0)
+    if (pubLaserCloudSurround->get_subscription_count() == 0)
         return;
 
     if (cloudKeyPoses3D->points.empty() == true)
@@ -2235,7 +2284,7 @@ void Map_Optimization::publishGlobalMap()
     downSizeFilterGlobalMapKeyFrames.setLeafSize(globalMapVisualizationLeafSize, globalMapVisualizationLeafSize, globalMapVisualizationLeafSize); // for global map visualization
     downSizeFilterGlobalMapKeyFrames.setInputCloud(globalMapKeyFrames);
     downSizeFilterGlobalMapKeyFrames.filter(*globalMapKeyFramesDS);
-    publishCloud(&pubLaserCloudSurround, globalMapKeyFramesDS, timeLaserInfoStamp, odometryFrame);
+    publishCloud(pubLaserCloudSurround, globalMapKeyFramesDS, timeLaserInfoStamp, odometryFrame);
 }
 
 void Map_Optimization::saveMap()
@@ -2261,7 +2310,7 @@ void Map_Optimization::saveMap()
     {
         *globalCornerCloud += *transformPointCloud(cornerCloudKeyFrames[i], &cloudKeyPoses6D->points[i]);
         *globalSurfCloud += *transformPointCloud(surfCloudKeyFrames[i], &cloudKeyPoses6D->points[i]);
-        cout << "\r" << std::flush << "Processing feature cloud " << i << " of " << cloudKeyPoses6D->size() << " ...";
+        std::cout << "\r" << std::flush << "Processing feature cloud " << i << " of " << cloudKeyPoses6D->size() << " ...";
     }
     std::cout << std::endl;
 
@@ -2275,23 +2324,22 @@ void Map_Optimization::saveMap()
 
 int main(int argc, char **argv)
 {
-    ros::init(argc, argv, "lo_sam");
+    rclcpp::init(argc, argv);
 
-    ros::NodeHandle nh;
-    ros::NodeHandle nh_private("~");
+    auto node = std::make_shared<Map_Optimization>(rclcpp::NodeOptions());
 
-    Map_Optimization MO(nh, nh_private);
+    RCLCPP_INFO(rclcpp::get_logger("MapOptimization"), "\033[1;32m----> Map Optimization Started.\033[0m");
 
-    ROS_INFO("\033[1;32m----> Map Optimization Started.\033[0m");
+    // 启动线程，传入智能指针
+    std::thread loopthread(&Map_Optimization::loopClosureThread, node);
+    std::thread visualizeMapThread(&Map_Optimization::visualizeGlobalMapThread, node);
 
-    std::thread loopthread(&Map_Optimization::loopClosureThread, &MO);
-    std::thread visualizeMapThread(&Map_Optimization::visualizeGlobalMapThread, &MO);
+    rclcpp::spin(node);
 
-    ros::spin();
-
-    // odom_estimate_thread.join();
+    // 等待线程退出
     loopthread.join();
     visualizeMapThread.join();
 
+    rclcpp::shutdown();
     return 0;
 }
